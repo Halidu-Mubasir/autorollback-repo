@@ -1,0 +1,146 @@
+name: Provision Infra with Terraform and Deploy App
+
+on:
+  workflow_dispatch:
+    inputs:
+      terraform_script_blob_path: # Full path: container/user_segment/config_id/deployment_instance_id/main.tf
+        description: 'Full Azure Blob path to the Terraform script (e.g., container/path/to/main.tf)'
+        required: true
+      # resource_group_name is defined *inside* the Terraform script now, not needed as a separate input here for TF execution.
+      # However, your AutoRollbackConfigForm might still have it for other purposes or for the TF script to use as a variable.
+      # For this workflow, the TF script is self-contained regarding RG creation/usage.
+      deployment_instance_id:
+        description: 'Unique ID for this deployment instance'
+        required: true
+      configuration_id:
+        description: 'Original AutoRollback Configuration ID'
+        required: true
+      # Add an input for the storage account name where the TF script is, if not derivable or fixed
+      tf_script_storage_account_name:
+        description: 'Azure Storage Account name where TF script is located'
+        required: true # Or get from secrets/env if always the same for the tool
+      # Add any other variables the Terraform script itself might need if not hardcoded
+      # For example, the app_service_name can be an output of TF or a variable passed to TF
+      # Let's assume TF script outputs the app_service_name
+
+jobs:
+  provision_and_deploy:
+    runs-on: ubuntu-latest
+    environment: Production # Optional
+
+    outputs: # Define outputs for this job
+      app_service_name_output: ${{ steps.tf_apply.outputs.app_service_name }}
+      app_service_hostname_output: ${{ steps.tf_apply.outputs.app_service_default_hostname }}
+      # Add other Terraform outputs you need later (e.g., for health checks)
+
+    env:
+      # ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID_FOR_TF }} # For Terraform AzureRM provider auth
+      # ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET_FOR_TF }}
+      # ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID_FOR_TF }}
+      # ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID_FOR_TF }}
+      # Using Azure Login action with a Service Principal is generally preferred over setting ARM_ env vars directly.
+      TF_WORKING_DIR: './terraform_scripts' # Directory to download and run Terraform scripts
+
+    steps:
+      - name: Checkout application code # Checks out the repo where this workflow file lives (your app repo)
+        uses: actions/checkout@v3
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }} # SP with permissions to read blob and create/manage Azure resources
+
+      - name: Echo Inputs
+        run: |
+          echo "Deployment Instance ID: ${{ github.event.inputs.deployment_instance_id }}"
+          echo "Config ID: ${{ github.event.inputs.configuration_id }}"
+          echo "Terraform Script Blob Path: ${{ github.event.inputs.terraform_script_blob_path }}"
+          echo "TF Script Storage Account: ${{ github.event.inputs.tf_script_storage_account_name }}"
+          echo "Working directory for TF: ${{ env.TF_WORKING_DIR }}"
+
+      - name: Create Terraform working directory
+        run: mkdir -p ${{ env.TF_WORKING_DIR }}
+
+      # Download Terraform script from Azure Blob Storage
+      # The terraform_script_blob_path input should be like "container_name/path/to/main.tf"
+      - name: Download Terraform Script
+        run: |
+          # Split the full blob path into container and blob_name_within_container
+          FULL_BLOB_PATH="${{ github.event.inputs.terraform_script_blob_path }}"
+          CONTAINER_NAME=$(echo $FULL_BLOB_PATH | cut -d'/' -f1)
+          BLOB_NAME_IN_CONTAINER=$(echo $FULL_BLOB_PATH | cut -d'/' -f2-) # The rest of the path after first '/'
+          
+          echo "Attempting to download from Container: $CONTAINER_NAME, Blob: $BLOB_NAME_IN_CONTAINER"
+          az storage blob download \
+            --account-name "${{ github.event.inputs.tf_script_storage_account_name }}" \
+            --container-name "$CONTAINER_NAME" \
+            --name "$BLOB_NAME_IN_CONTAINER" \
+            --file "${{ env.TF_WORKING_DIR }}/main.tf" \
+            --auth-mode login # Uses the Azure CLI login from previous step
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: "latest" # Or specify a version like "1.5.0"
+
+      - name: Terraform Init
+        id: tf_init
+        run: terraform init -input=false -no-color
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        # Add backend configuration here if your TF script expects it and it's not in main.tf
+        # Example for AzureRM backend:
+        # env:
+        #   ARM_ACCESS_KEY: ${{ secrets.TF_STATE_STORAGE_ACCESS_KEY }} # For Terraform state storage
+
+      - name: Terraform Validate
+        id: tf_validate
+        run: terraform validate -no-color
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Plan
+        id: tf_plan
+        run: terraform plan -input=false -no-color -out=tfplan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        # Pass variables to terraform plan if your TF script needs them and they are not set via tfvars or env vars
+        # Example: -var="resource_group_name=${{ github.event.inputs.resource_group_name }}"
+        # However, the TF script generated by your tool should be self-contained or take standard inputs.
+
+      - name: Terraform Apply
+        id: tf_apply
+        run: terraform apply -input=false -auto-approve -no-color tfplan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      # After terraform apply, we need the name of the App Service that was created.
+      # This assumes your Terraform script has an output named "app_service_name" and "app_service_default_hostname"
+      - name: Get Terraform Outputs
+        id: tf_outputs
+        run: |
+          cd ${{ env.TF_WORKING_DIR }}
+          APP_NAME=$(terraform output -raw app_service_name)
+          APP_HOSTNAME=$(terraform output -raw app_service_default_hostname)
+          echo "App Service Name from TF: $APP_NAME"
+          echo "App Service Hostname from TF: $APP_HOSTNAME"
+          echo "app_service_name_output=$APP_NAME" >> $GITHUB_OUTPUT
+          echo "app_service_hostname_output=$APP_HOSTNAME" >> $GITHUB_OUTPUT
+        working-directory: ${{ env.TF_WORKING_DIR }} # Ensure this is correct if cd is used above
+
+      - name: Deploy to Azure App Service (Static Content)
+        if: steps.tf_outputs.outputs.app_service_name_output != '' # Only run if app_service_name was outputted
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: ${{ steps.tf_outputs.outputs.app_service_name_output }}
+          package: '.' # Deploy current directory content (where index.html is from checkout)
+                       # If your app code is in a subfolder, e.g. 'dist', use package: 'dist'
+
+      - name: Echo Deployed URL
+        if: steps.tf_outputs.outputs.app_service_hostname_output != ''
+        run: |
+          echo "Application should be available at: https://${{ steps.tf_outputs.outputs.app_service_hostname_output }}"
+          echo "Health check endpoint to verify: https://${{ steps.tf_outputs.outputs.app_service_hostname_output }}/index.html" # Or your actual health path
+
+      - name: Azure Logout
+        run: |
+          az logout
+          az cache purge
+          az account clear
+        if: always()
